@@ -15,7 +15,7 @@ from pathlib import Path
 from agent_framework import Agent, MCPStreamableHTTPTool
 from agent_framework.openai import OpenAIChatCompletionClient
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, OpenAI
 
 import raadsleden
 
@@ -25,39 +25,108 @@ ROLLEN = ("archmage", "engineer", "guardian_keeper", "historian", "oracle", "bea
 BEURTENBUDGET = 10  # spelregel: maximaal 10 Raadslid-beurten (berichten van Raadsleden) per run
 
 
+def _vaste_volgorde(beurten, leden, extra_reden=""):
+    """Fallback: wie is er in alfabetische volgorde aan de beurt? Gebruikt als de LLM-Koning faalt."""
+    rondes = int(os.getenv("RONDES", "2"))
+    gesproken = sum(1 for b in beurten if b["soort"] == "bericht" and b["spreker"] in ROLLEN)
+    if gesproken >= rondes * len(leden):
+        return None, None, f"vaste volgorde: alle rondes gespeeld{(' — ' + extra_reden) if extra_reden else ''}"
+    lid = leden[gesproken % len(leden)]
+    return lid.ROL, "Geef je inbreng in hoogstens 150 woorden. Reageer op wat de anderen zeiden.", f"vaste volgorde{(' (' + extra_reden + ')') if extra_reden else ''}"
+
+
 def kies_volgende(beurten, leden):
     """De Koning leidt het debat: hij beslist wie spreekt. De kit roept deze functie op vóór elke beurt.
     (In AI-termen heet dit deel een orchestrator.)
 
-    Je krijgt:
-      beurten  het debat tot nu toe, dezelfde lijst als in trace.json. Een bericht van een
-               Raadslid ziet er zo uit: {"soort": "bericht", "spreker": "engineer", "tekst": "..."}
-      leden    de Raadsleden uit raadsleden/, elk met .ROL, .NAAM en .PERSPECTIEF
-
-    Je geeft terug:
-      (rol, vraag, reden)   wie nu spreekt, welke vraag die krijgt en waarom je hem kiest
-      (None, None, reden)   het debat stopt, met de reden waarom
-    De reden komt in de trace en in de viewer. De jury leest ze: maak ze concreet.
-
-    TODO voor jullie team:
-    Nu praat iedereen om de beurt, in een vaste volgorde, ook als dat niets toevoegt. Er zijn maar
-    10 Raadslid-beurten, dus zo verspil je beurten. Laat de Koning in deze functie naar het debat
-    kijken en elke beurt bewust kiezen. Vragen om mee te starten:
-      - Wie heeft nog niet gesproken, en wiens kennis ontbreekt nog?
-      - Iemand verwijst naar een andere Rol of doet een bewering: wie kan dat controleren?
-      - Welke delen van de oorzaak (ingreep, mechanisme, verloop) zijn nog onbekend?
-      - Weet de Council genoeg? Stop dan zelf, vóór het budget op is.
-    Twee manieren (of een mix):
-      - regels in code, bv. "wie genoemd wordt, moet het toetsen";
-      - een agent: de Koning als LLM die het debat leest en (rol, vraag, reden) teruggeeft.
-        Meestal sneller gebouwd en slimmer dan regels: zie "Regels of een agent?" in de README.
+    De Koning is hier een LLM-agent: hij leest het debat tot nu toe en kiest bewust wie spreekt,
+    met welke vraag en waarom. Hij kan ook zelf stoppen als de Council genoeg weet voor een Verdict,
+    vóór het Beurtenbudget op is. Bij een netwerkfout of ongeldig antwoord valt hij terug op de
+    alfabetische vaste volgorde.
     """
-    rondes = int(os.getenv("RONDES", "2"))
-    gesproken = sum(1 for b in beurten if b["soort"] == "bericht" and b["spreker"] in ROLLEN)
-    if gesproken >= rondes * len(leden):
-        return None, None, "vaste volgorde: alle rondes gespeeld"
-    lid = leden[gesproken % len(leden)]
-    return lid.ROL, "Geef je inbreng in hoogstens 150 woorden. Reageer op wat de anderen zeiden.", "vaste volgorde"
+    gesproken_berichten = [b for b in beurten if b["soort"] == "bericht" and b["spreker"] in ROLLEN]
+    gesproken = len(gesproken_berichten)
+    gesproken_rollen = {b["spreker"] for b in gesproken_berichten}
+    aanwezige_rollen = [l.ROL for l in leden]
+    niet_gesproken = [r for r in aanwezige_rollen if r not in gesproken_rollen]
+    beurten_over = BEURTENBUDGET - gesproken
+
+    # Eerste beurt: altijd het eerste lid (alfabetisch), om context op te bouwen.
+    if gesproken == 0:
+        lid = leden[0]
+        return (
+            lid.ROL,
+            "Introduceer je perspectief en vertel wat jouw Kennisbron over de Desync zegt. "
+            "Noem minstens twee concrete record-ID's uit je bron.",
+            "eerste beurt: context opbouwen vanaf de eerste Rol",
+        )
+
+    # Bouw een beknopt overzicht van het debat voor de Koning.
+    debat_regels = []
+    for b in gesproken_berichten:
+        tekst = b["tekst"]
+        if len(tekst) > 700:
+            tekst = tekst[:700] + "..."
+        debat_regels.append(f"[{b['spreker']}]: {tekst}")
+
+    rollen_tekst = "\n".join(f"- {l.ROL} ({l.NAAM}): {l.PERSPECTIEF}" for l in leden)
+    niet_gesproken_tekst = ", ".join(niet_gesproken) if niet_gesproken else "(iedereen heeft al minstens één keer gesproken)"
+
+    prompt = (
+        "Je bent de Koning van de Council of Achrona. Je leidt het debat over de Desync, maar spreekt zelf niet "
+        "en leest geen Kennisbron. Je taak: kies voor de volgende beurt het Raadslid dat de Council het meest verder helpt, "
+        "of stop het debat als de Council genoeg weet voor een Verdict.\n\n"
+        f"Beschikbare Raadsleden:\n{rollen_tekst}\n\n"
+        f"Raadsleden die nog NIET gesproken hebben: {niet_gesproken_tekst}\n"
+        f"Resterend Beurtenbudget: {beurten_over} Raadslid-beurten.\n\n"
+        "Debat tot nu toe:\n\n" + "\n\n".join(debat_regels) + "\n\n"
+        "Kies bewust. Weeg mee:\n"
+        "- Welke beweringen zijn nog niet door een ander Raadslid getoetst?\n"
+        "- Naar welke Rol verwees iemand, of wiens kennis ontbreekt nog?\n"
+        "- Welke delen van de oorzaak (ingreep, mechanisme, verloop) zijn nog onbekend?\n"
+        "- Herhaalt een Raadslid alleen wat er al staat? Kies dan iemand anders.\n"
+        "- Als de Council de oorzaak, het herstelplan en de risico's helder genoeg heeft, stop dan (rol = null).\n\n"
+        "Antwoord ALLEEN met geldige JSON in exact dit formaat (geen tekst eromheen, geen markdown-codefences):\n"
+        '{"rol": "<rolnaam uit de lijst hierboven, of null om te stoppen>", '
+        '"vraag": "<de concrete vraag voor dat Raadslid, maximaal 2 zinnen>", '
+        '"reden": "<waarom je deze keuze maakt, maximaal 1 zin>"}'
+    )
+
+    try:
+        sync_client = OpenAI(
+            base_url=os.environ["OPENAI_BASE_URL"],
+            api_key=os.environ["OPENAI_API_KEY"],
+            max_retries=3,
+        )
+        r = sync_client.chat.completions.create(
+            model=os.environ["MODEL_GROOT"],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        ruw = (r.choices[0].message.content or "").strip()
+    except Exception as e:  # netwerkfout, rate limit uitgeput, etc.
+        return _vaste_volgorde(beurten, leden, extra_reden=f"LLM-fout: {e.__class__.__name__}")
+
+    # Modellen zetten soms tekst of markdown rond hun JSON: knip naar { ... }.
+    start, eind = ruw.find("{"), ruw.rfind("}")
+    if start == -1 or eind == -1:
+        return _vaste_volgorde(beurten, leden, extra_reden="Koning gaf geen JSON terug")
+    try:
+        keuze = json.loads(ruw[start:eind + 1])
+    except json.JSONDecodeError:
+        return _vaste_volgorde(beurten, leden, extra_reden="Koning gaf ongeldige JSON")
+
+    rol = keuze.get("rol")
+    vraag = (keuze.get("vraag") or "").strip() or "Geef je inbreng in hoogstens 150 woorden en reageer op wat er al gezegd is."
+    reden = (keuze.get("reden") or "").strip() or "Koning kiest"
+
+    # Stoppen: rol = null, "null", lege string of iets dat niet in de lijst zit.
+    if rol in (None, "", "null"):
+        return None, None, reden
+
+    if rol not in aanwezige_rollen:
+        return _vaste_volgorde(beurten, leden, extra_reden=f"Koning koos onbekende rol {rol!r}")
+
+    return rol, vraag, reden
 
 
 def controleer(leden):
@@ -206,28 +275,67 @@ async def run():
     beurt(ronde + 1, "koning", "bericht", tekst=r.text)
     print(f"\n[Koning]:\n{r.text}")
 
-    # De Koning stelt het Verdict op in JSON-formaat op basis van het hele debat.
+    # Stap 1: Geschillen extractie — waar spraken Raadsleden elkaar tegen, en hoe werd het beslecht?
+    geschillen_prompt = (
+        "Je bent de Koning van de Council of Achrona. Lees het debat hieronder en identificeer de GESCHILLEN: "
+        "concrete punten waarop twee of meer Raadsleden het oneens waren, of een bewering die een ander tegensprak.\n\n"
+        "Antwoord ALLEEN met geldige JSON, een lijst (eventueel leeg) in exact dit formaat (geen tekst eromheen, "
+        "geen markdown-codefences):\n"
+        "[\n"
+        "  {\n"
+        '    "onderwerp": "<waar ging het geschil over, één zin>",\n'
+        '    "standpunten": [\n'
+        '      {"rol": "<rolnaam>", "standpunt": "<korte samenvatting, max 1 zin>", "bewijs": ["<record-ID>", ...]}\n'
+        "    ],\n"
+        '    "beslechting": "<hoe werd het beslecht in het debat, of \'onopgelost\' als er geen consensus kwam>"\n'
+        "  }\n"
+        "]\n\n"
+        "Regels:\n"
+        "- Alleen echte tegenspraken. Gebruik geen geschil om dingen op te vullen die niemand tegensprak.\n"
+        "- Als er geen geschillen waren, antwoord met een lege lijst: [].\n"
+        "- Gebruik alleen rolnamen die in het debat voorkomen en record-ID's die echt genoemd zijn.\n"
+        "- Gewoon koppelteken (-) in record-ID's, geen speciaal teken.\n\n"
+        "Debat:\n\n" + "\n\n".join(debat)
+    )
+    geschillen_r = await koning.run(geschillen_prompt, options=opties)
+    tel(verbruik, "groot", geschillen_r.usage_details)
+    geschillen_ruw = (geschillen_r.text or "").strip().replace("‑", "-")
+    g_start, g_eind = geschillen_ruw.find("["), geschillen_ruw.rfind("]")
+    if g_start != -1 and g_eind != -1:
+        try:
+            trace["geschillen"] = json.loads(geschillen_ruw[g_start:g_eind + 1])
+        except json.JSONDecodeError:
+            trace["geschillen"] = []  # geen harde fout: het Verdict is belangrijker
+    bewaar("trace.json", trace)
+    print(f"\n[Koning] geschillen gevonden: {len(trace['geschillen'])}")
+
+    # Stap 2: Het Verdict in JSON — expliciet per deel van de oorzaak, met bewijs of eerlijk null.
     verdict_prompt = (
-            "Je bent de Koning van de Council of Achrona. Op basis van het volledige debat hieronder "
-            "en je eerdere samenvatting stel je nu het officiële Verdict op.\n\n"
-            "Antwoord ALLEEN met geldige JSON in exact dit formaat (geen tekst eromheen):\n"
+            "Je bent de Koning van de Council of Achrona. Op basis van het volledige debat hieronder, "
+            "je eerdere samenvatting en de gevonden geschillen stel je nu het officiële Verdict op.\n\n"
+            "Antwoord ALLEEN met geldige JSON in exact dit formaat (geen tekst eromheen, geen markdown-codefences):\n"
             "{\n"
-            '  "samenvatting": "<één alinea die het antwoord samenvat>",\n'
+            '  "samenvatting": "<één alinea die de hele zaak samenvat, max 4 zinnen>",\n'
             '  "oorzaak": {\n'
-            '    "ingreep":    {"bewering": "<wie deed wat, of null>",       "bewijs": ["<record-ID>", ...]},\n'
-            '    "mechanisme": {"bewering": "<hoe werkt het, of null>",      "bewijs": ["<record-ID>", ...]},\n'
-            '    "verloop":    {"bewering": "<hoe ging het in de tijd, of null>", "bewijs": ["<record-ID>", ...]}\n'
+            '    "ingreep":    {"bewering": "<wie deed wat, concreet, of null>",            "bewijs": ["<record-ID>", ...]},\n'
+            '    "mechanisme": {"bewering": "<hoe werkt het technisch/magisch, of null>",   "bewijs": ["<record-ID>", ...]},\n'
+            '    "verloop":    {"bewering": "<hoe ging het in de tijd, met data/volgorde, of null>", "bewijs": ["<record-ID>", ...]}\n'
             "  },\n"
             '  "acties": [{"actie": "<wat te doen>", "reden": "<waarom>"}, ...],\n'
             '  "risicos": [{"risico": "<wat kan misgaan>", "mitigatie": "<hoe beperken>"}, ...]\n'
             "}\n\n"
-            "Belangrijke regels:\n"
+            "Belangrijke regels voor de inhoud:\n"
+            "- Werk de DRIE delen van de oorzaak afzonderlijk uit: ingreep (de dader/handeling), "
+            "mechanisme (hoe de schade ontstaat), verloop (de volgorde of tijdlijn).\n"
+            "- Elk deel krijgt een concrete bewering met minstens één record-ID als bewijs, OF "
+            "\"bewering\": null en \"bewijs\": [] als het debat onvoldoende zekerheid gaf. Nooit vaag.\n"
             "- Gebruik alleen record-ID's die een Raadslid in het debat echt noemde. Verzin er geen.\n"
-            "- Weet je een deel van de oorzaak niet, zet dan \"bewering\": null en \"bewijs\": [].\n"
             "- Gebruik een gewoon koppelteken (-) in record-ID's, geen speciaal teken.\n"
-            "- Geef minstens één actie en minstens één risico.\n\n"
+            "- Geef minstens één actie (geordend herstelplan) en minstens één risico met mitigatie.\n"
+            "- Als geschillen onopgelost zijn, weeg dat mee in de zekerheid: liever \"bewering\": null dan gokken.\n\n"
             "Debat:\n\n" + "\n\n".join(debat)
             + "\n\nJouw eerdere samenvatting:\n\n" + r.text
+            + "\n\nGevonden geschillen:\n\n" + json.dumps(trace["geschillen"], indent=2, ensure_ascii=False)
     )
     verdict_r = await koning.run(verdict_prompt, options=opties)
     tel(verbruik, "groot", verdict_r.usage_details)
@@ -243,11 +351,6 @@ async def run():
     except json.JSONDecodeError as e:
         sys.exit(f"Koning gaf ongeldige JSON terug: {e}\n{ruw}")
     verdict["run_id"] = run_id  # run_id voegen we zelf toe, niet aan het model overlaten
-
-    trace["status"], trace["aan_het_woord"] = "klaar", None
-    bewaar("trace.json", trace)
-    bewaar("verdict.json", verdict)
-
 
     trace["status"], trace["aan_het_woord"] = "klaar", None
     bewaar("trace.json", trace)
