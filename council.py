@@ -206,14 +206,49 @@ async def run():
     beurt(ronde + 1, "koning", "bericht", tekst=r.text)
     print(f"\n[Koning]:\n{r.text}")
 
-    # TODO voor jullie team: laat de Council dit Verdict zelf invullen (zie schema/verdict.json).
-    verdict = {
-        "run_id": run_id,
-        "samenvatting": "TODO",
-        "oorzaak": {slot: {"bewering": None, "bewijs": []} for slot in ("ingreep", "mechanisme", "verloop")},
-        "acties": [{"actie": "TODO", "reden": "TODO"}],
-        "risicos": [{"risico": "TODO", "mitigatie": "TODO"}],
-    }
+    # De Koning stelt het Verdict op in JSON-formaat op basis van het hele debat.
+    verdict_prompt = (
+            "Je bent de Koning van de Council of Achrona. Op basis van het volledige debat hieronder "
+            "en je eerdere samenvatting stel je nu het officiële Verdict op.\n\n"
+            "Antwoord ALLEEN met geldige JSON in exact dit formaat (geen tekst eromheen):\n"
+            "{\n"
+            '  "samenvatting": "<één alinea die het antwoord samenvat>",\n'
+            '  "oorzaak": {\n'
+            '    "ingreep":    {"bewering": "<wie deed wat, of null>",       "bewijs": ["<record-ID>", ...]},\n'
+            '    "mechanisme": {"bewering": "<hoe werkt het, of null>",      "bewijs": ["<record-ID>", ...]},\n'
+            '    "verloop":    {"bewering": "<hoe ging het in de tijd, of null>", "bewijs": ["<record-ID>", ...]}\n'
+            "  },\n"
+            '  "acties": [{"actie": "<wat te doen>", "reden": "<waarom>"}, ...],\n'
+            '  "risicos": [{"risico": "<wat kan misgaan>", "mitigatie": "<hoe beperken>"}, ...]\n'
+            "}\n\n"
+            "Belangrijke regels:\n"
+            "- Gebruik alleen record-ID's die een Raadslid in het debat echt noemde. Verzin er geen.\n"
+            "- Weet je een deel van de oorzaak niet, zet dan \"bewering\": null en \"bewijs\": [].\n"
+            "- Gebruik een gewoon koppelteken (-) in record-ID's, geen speciaal teken.\n"
+            "- Geef minstens één actie en minstens één risico.\n\n"
+            "Debat:\n\n" + "\n\n".join(debat)
+            + "\n\nJouw eerdere samenvatting:\n\n" + r.text
+    )
+    verdict_r = await koning.run(verdict_prompt, options=opties)
+    tel(verbruik, "groot", verdict_r.usage_details)
+
+    # Lees het JSON-antwoord. Modellen zetten soms tekst eromheen, dus knippen we naar { ... }.
+    ruw = verdict_r.text.strip()
+    ruw = ruw.replace("‑", "-")  # vervang speciaal koppelteken door een gewoon
+    start, eind = ruw.find("{"), ruw.rfind("}")
+    if start == -1 or eind == -1:
+        sys.exit(f"Koning gaf geen JSON terug:\n{ruw}")
+    try:
+        verdict = json.loads(ruw[start:eind + 1])
+    except json.JSONDecodeError as e:
+        sys.exit(f"Koning gaf ongeldige JSON terug: {e}\n{ruw}")
+    verdict["run_id"] = run_id  # run_id voegen we zelf toe, niet aan het model overlaten
+
+    trace["status"], trace["aan_het_woord"] = "klaar", None
+    bewaar("trace.json", trace)
+    bewaar("verdict.json", verdict)
+
+
     trace["status"], trace["aan_het_woord"] = "klaar", None
     bewaar("trace.json", trace)
     bewaar("verdict.json", verdict)
